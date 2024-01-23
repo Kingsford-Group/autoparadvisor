@@ -71,7 +71,12 @@ class CASMOPOLITANMixed(CASMOPOLITANCat):
 
         self.kwargs = kwargs
         # Save function information for both the continuous and categorical parts.
-        self.cat_dims, self.cont_dims = cat_dim, cont_dim
+        self.cat_len = len(cat_dim) # length of cat_dims
+        if len(cat_dim) == 0:
+            self.cat_dims = None
+        else:
+            self.cat_dims = cat_dim # array of cat index
+        self.cont_dims = cont_dim # array of cont index
         self.int_constrained_dims = int_constrained_dims
         # self.n_categories = n_cats
         self.lb = lb
@@ -123,7 +128,8 @@ class CASMOPOLITANMixed(CASMOPOLITANCat):
             gp = train_gp(
                 train_x=X_torch, train_y=y_torch, use_ard=self.use_ard, num_steps=n_training_steps, hypers=hypers,
                 kern=self.kernel_type,
-                cat_dims=self.cat_dims, cont_dims=self.cont_dims,
+                cat_dims=self.cat_dims, 
+                cont_dims=self.cont_dims,
                 int_constrained_dims=self.int_constrained_dims,
                 noise_variance=self.kwargs['noise_variance'] if 'noise_variance' in self.kwargs else None,
                 cont_lb = self.lb,
@@ -151,19 +157,21 @@ class CASMOPOLITANMixed(CASMOPOLITANCat):
         def thompson(n_cand=5000,**kwargs):
             """Thompson sampling"""
             #pdb.set_trace()
+            if self.cat_len > 0:
             # Generate n_cand of candidates for the discrete variables, in their trust region
-            X_cand_cat = np.array([
-                random_sample_within_discrete_tr_ordinal(x_center[0][self.cat_dims], length, self.config)
-                for _ in range(n_cand)
-            ])
+                X_cand_cat = np.array([
+                    random_sample_within_discrete_tr_ordinal(x_center[0][self.cat_dims], length, self.config)
+                    for _ in range(n_cand)
+                ])
 
             X_cand_cont = x_center[0][self.cont_dims].copy() * np.ones((n_cand, len(self.cont_dims)))
             #pdb.set_trace()
             pert = np.zeros_like(X_cand_cont)
             seed = np.random.randint(int(1e6))
-            sobol = SobolEngine(len(self.pure_cont_dims), scramble=True, seed=seed)
-            pert[:,self.pure_cont_dims] = sobol.draw(n_cand).to(dtype=dtype, device=device).cpu().detach().numpy()
-            pert[:,self.pure_cont_dims] = lb[self.pure_cont_dims] + (ub[self.pure_cont_dims] - lb[self.pure_cont_dims]) * pert[:,self.pure_cont_dims]
+            if len(self.pure_cont_dims) > 0:
+                sobol = SobolEngine(len(self.pure_cont_dims), scramble=True, seed=seed)
+                pert[:,self.pure_cont_dims] = sobol.draw(n_cand).to(dtype=dtype, device=device).cpu().detach().numpy()
+                pert[:,self.pure_cont_dims] = lb[self.pure_cont_dims] + (ub[self.pure_cont_dims] - lb[self.pure_cont_dims]) * pert[:,self.pure_cont_dims]
             if(self.integer_dims is not None):
                 pert[:,self.integer_dims] = np.hstack([np.random.random_integers (x, y, [n_cand, 1]) for x,y in integer_range.T])
                 pert[:,self.integer_dims] = to_unit_cube(pert[:,self.integer_dims],self.lb[self.integer_dims],self.ub[self.integer_dims])
@@ -175,7 +183,12 @@ class CASMOPOLITANMixed(CASMOPOLITANCat):
             
             X_cand_cont[mask] = pert[mask]
 
-            X_cand = np.hstack((X_cand_cat, X_cand_cont))
+            #if is mixed type, conmbine cag and cont parameters
+            if self.cat_len > 0:
+                for index, value in enumerate(self.cat_dims):
+                    new_cat = np.reshape(X_cand_cat[:,index], (n_cand,1))
+                    X_cand_cont = np.insert(X_cand_cont, [value], new_cat, axis=1)
+            X_cand = X_cand_cont
 
             # Generate n_cand candidates for the continuous variables, in their trust region
             with torch.no_grad(), gpytorch.settings.max_cholesky_size(self.max_cholesky_size):

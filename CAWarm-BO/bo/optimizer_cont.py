@@ -13,12 +13,11 @@ from torch.quasirandom import SobolEngine
 import pdb
 
 
-class MixedOptimizer(Optimizer):
+class ContOptimizer(Optimizer):
 
     def __init__(self, config,
                  lb, ub,
                  cont_dims,
-                 cat_dims,
                  int_constrained_dims=None,
                  default_x = [],
                  n_init: int = None,
@@ -29,33 +28,29 @@ class MixedOptimizer(Optimizer):
 
         Parameters
         ----------
-        config: list. e.g. [2, 3, 4, 5] -- denotes there are 4 categorical variables, with numbers of categories
-            being 2, 3, 4, and 5 respectively.
         guided_restart: whether to fit an auxiliary GP over the best points encountered in all previous restarts, and
             sample the points with maximum variance for the next restart.
         """
-        super(MixedOptimizer, self).__init__(config, default_x, n_init, wrap_discrete, guided_restart, **kwargs)
+        super(ContOptimizer, self).__init__(config, default_x, n_init, wrap_discrete, guided_restart, **kwargs)
 
         self.kwargs = kwargs
         # Maps the input order.
-        self.d_cat, self.d_cont = cat_dims, cont_dims
-        self.true_dim = len(cont_dims) + len(cat_dims)
+        self.d_cont = cont_dims
+        self.true_dim = len(cont_dims)
 
-        # Number of one hot dimensions
-        self.n_onehot = int(np.sum(config))
-        # One-hot bounds
-        self.lb = np.hstack((np.zeros(self.n_onehot), lb))
-        self.ub = np.hstack((np.ones(self.n_onehot), ub))
+        # bounds
+        self.lb = lb
+        self.ub = ub
         self.dim = len(self.lb)
         #self.default_x = default_x
         #pdb.set_trace()
 
-        self.casmopolitan = CASMOPOLITANMixed(
+        self.casmopolitan = CASMOPOLITANMixed( 
             config=self.config,
-            cat_dim=cat_dims,
+            cat_dim=[],
             cont_dim=cont_dims,
             int_constrained_dims=int_constrained_dims,
-            lb=self.lb[self.n_onehot:], ub=self.ub[self.n_onehot:],
+            lb=self.lb, ub=self.ub,
             n_init=n_init if n_init is not None else 2 * self.true_dim + 1,
             max_evals=self.max_evals,
             batch_size=1,  # We need to update this later
@@ -82,7 +77,7 @@ class MixedOptimizer(Optimizer):
                 self.best_X_each_restart = np.vstack((self.best_X_each_restart, deepcopy(self.casmopolitan._X[best_idx])))
 
             best_X_each_restart = deepcopy(self.best_X_each_restart).reshape(-1, self.true_dim)
-            best_X_each_restart[:, self.casmopolitan.cont_dims] = to_unit_cube(best_X_each_restart[:, self.casmopolitan.cont_dims], self.lb[self.n_onehot:],self.ub[self.n_onehot:])
+            best_X_each_restart[:, self.casmopolitan.cont_dims] = to_unit_cube(best_X_each_restart[:, self.casmopolitan.cont_dims], self.lb, self.ub)
             best_fX_each_restart = copula_standardize(deepcopy(self.best_fX_each_restart).ravel())  # Use Copula
 
             X_tr_torch = torch.tensor(best_X_each_restart, dtype=torch.float32)
@@ -91,7 +86,6 @@ class MixedOptimizer(Optimizer):
             #pdb.set_trace()
             self.auxiliary_gp = train_gp(
                 X_tr_torch, fX_tr_torch, self.casmopolitan.use_ard, 300, kern=self.casmopolitan.kernel_type,
-                cat_dims=self.casmopolitan.cat_dims,
                 cont_dims=self.casmopolitan.cont_dims,
                 int_constrained_dims=self.casmopolitan.int_constrained_dims,
                 noise_variance=self.casmopolitan.kwargs['noise_variance'] if 'noise_variance' in self.casmopolitan.kwargs else None,
@@ -100,19 +94,7 @@ class MixedOptimizer(Optimizer):
             )
             # Generate random points in a Thompson-style sampling
             X_init = latin_hypercube(self.casmopolitan.n_cand, self.dim)
-            #X_init = from_unit_cube(X_init, self.lb, self.ub)
-            # Isolate the continuous part and categorical part
-            X_init_cat, X_init_cont = X_init[:, :self.n_onehot], X_init[:, self.n_onehot:]
-            if self.wrap_discrete:
-                X_init_cat = self.warp_discrete(X_init_cat, )
-            X_init_cat = onehot2ordinal(X_init_cat, self.cat_dims)
-            # Put the two parts back by a hstack
-            #X_init = np.hstack((X_init_cat, X_init_cont))
-            #NOTE: change stack manar into insert according to dim of cat
-            for index, value in enumerate(self.d_cat):
-                new_cat = np.reshape(X_init_cat[:,index], (self.casmopolitan.n_init,1))
-                X_init_cont = np.insert(X_init_cont, [value], new_cat, axis=1)
-            X_init = X_init_cont
+            X_init = from_unit_cube(X_init, self.lb, self.ub)
 
             with torch.no_grad():
                 self.auxiliary_gp.eval()
@@ -131,7 +113,7 @@ class MixedOptimizer(Optimizer):
             # cThe initial trust region centre for the restart
             centre = deepcopy(X_init[indbest, :])
             # Separate the continuous and categorical parts of the centre.
-            centre_cat, centre_cont = centre[self.d_cat], centre[self.d_cont]
+            centre_cont = centre[self.d_cont]
 
             # Generate random samples around the continuous centre similar to the original TuRBO
             centre_cont = centre_cont[None, :]
@@ -149,21 +131,9 @@ class MixedOptimizer(Optimizer):
             mask[ind, np.random.randint(0, len(self.d_cont) - 1, size=len(ind))] = 1
             X_init_cont = centre_cont.copy() * np.ones((self.casmopolitan.n_init, len(self.d_cont)))
             X_init_cont[mask] = pert[mask]
-            X_init_cont = from_unit_cube(X_init_cont, self.lb[self.n_onehot:],self.ub[self.n_onehot:])
+            X_init_cont = from_unit_cube(X_init_cont, self.lb, self.ub)
 
-            # Generate the random samples around the categorical centre similar to the discrete CASMOPLTN
-            X_init_cat = []
-            for i in range(self.casmopolitan.n_init):
-                cat_sample = deepcopy(
-                    random_sample_within_discrete_tr_ordinal(centre_cat, self.casmopolitan.length_init_discrete, self.config),
-                )
-                X_init_cat.append(cat_sample)
-            X_init_cat = np.array(X_init_cat)
-            #NOTE: change stack manar into insert according to dim of cat
-            #self.X_init = np.hstack((X_init_cat, X_init_cont))
-            for index, value in enumerate(self.d_cat):
-                new_cat = np.reshape(X_init_cat[:,index], (self.casmopolitan.n_init,1))
-                X_init_cont = np.insert(X_init_cont, [value], new_cat, axis=1)
+            # restart with new X
             self.X_init = X_init_cont
             self.casmopolitan._restart()
             self.casmopolitan._X = np.zeros((0, self.casmopolitan.dim))
@@ -177,17 +147,8 @@ class MixedOptimizer(Optimizer):
             self.casmopolitan._fX = np.zeros((0, 1))
             X_init = latin_hypercube(self.casmopolitan.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
-            X_init_cat, X_init_cont = X_init[:, :self.n_onehot], X_init[:, self.n_onehot:]
-            if self.wrap_discrete:
-                X_init_cat = self.warp_discrete(X_init_cat, )
-            X_init_cat = onehot2ordinal(X_init_cat, self.cat_dims)
-            # Put the two parts back by a hstack
-            # self.X_init = np.hstack((X_init_cat, X_init_cont))
-            #NOTE: change stack manar into insert according to dim of cat 
-            for index, value in enumerate(self.d_cat):
-                new_cat = np.reshape(X_init_cat[:,index], (self.casmopolitan.n_init,1))
-                X_init_cont = np.insert(X_init_cont, [value], new_cat, axis=1)
-            self.X_init = X_init_cont
+
+            self.X_init = X_init
             #pdb.set_trace()
             if(self.casmopolitan.int_constrained_dims is not None):
                 self.X_init[:,self.casmopolitan.int_constrained_dims] = np.round(self.X_init[:,self.casmopolitan.int_constrained_dims])
@@ -223,13 +184,13 @@ class MixedOptimizer(Optimizer):
                 #pdb.set_trace()
                 X = deepcopy(self.casmopolitan._X)
                 # Pre-process the continuous dimensions
-                X[:, self.casmopolitan.cont_dims] = to_unit_cube(X[:, self.casmopolitan.cont_dims], self.lb[self.n_onehot:],
-                                                          self.ub[self.n_onehot:])
+                X[:, self.casmopolitan.cont_dims] = to_unit_cube(X[:, self.casmopolitan.cont_dims], self.lb,
+                                                          self.ub)
                 fX = copula_standardize(deepcopy(self.casmopolitan._fX).ravel())  # Use Copula
                 next = self.casmopolitan._create_and_select_candidates(X, fX, length=self.casmopolitan.length_discrete,
                                                                        n_training_steps=300, hypers={})[-n_adapt:, :]
-                next[:, self.casmopolitan.cont_dims] = from_unit_cube(next[:, self.casmopolitan.cont_dims], self.lb[self.n_onehot:],
-                                                               self.ub[self.n_onehot:])
+                next[:, self.casmopolitan.cont_dims] = from_unit_cube(next[:, self.casmopolitan.cont_dims], self.lb,
+                                                               self.ub)
                 X_next[-n_adapt:, :] = next
 
                 # Unwarp the suggestions
